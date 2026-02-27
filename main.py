@@ -1,15 +1,24 @@
 import json
+import os
 import re
 import httpx
+import diskcache
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
 app = FastAPI()
+cache = diskcache.Cache(".cache/gemini")
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "gemma3:latest"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
+MODEL = "gemini-3-flash-preview"
+
+if GEMINI_API_KEY:
+    print(f"[STARTUP] GEMINI_API_KEY is set ({len(GEMINI_API_KEY)} chars)", flush=True)
+else:
+    print("[STARTUP] WARNING: GEMINI_API_KEY is NOT set! API calls will fail.", flush=True)
 
 NUM_BRANCHES = 4
 
@@ -98,24 +107,41 @@ def extract_json_array(text):
     raise ValueError(f"No JSON array found in: {text[:200]}")
 
 
-def call_ollama(system_prompt, user_content):
-    """Make a single Ollama API call and return parsed predictions."""
+def call_gemini(system_prompt, user_content):
+    """Make a single Gemini API call and return parsed predictions. Results are cached to disk."""
+    cache_key = f"{MODEL}:{system_prompt}:{user_content}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        print(f"\n[CACHE HIT] {user_content[:80]}...", flush=True)
+        return cached
+
+    print(f"\n[GEMINI] Calling {MODEL}...", flush=True)
+    print(f"[GEMINI] System: {system_prompt[:80]}...", flush=True)
+    print(f"[GEMINI] User: {user_content[:80]}...", flush=True)
+    if not GEMINI_API_KEY:
+        print("[GEMINI] ERROR: GEMINI_API_KEY is not set!", flush=True)
+        raise ValueError("GEMINI_API_KEY environment variable is not set")
     with httpx.Client(timeout=120.0) as http_client:
         response = http_client.post(
-            OLLAMA_URL,
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
             json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content + "\n\n/no_think"},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.8, "num_predict": 1024},
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+                "generationConfig": {
+                    "temperature": 0.8,
+                    "maxOutputTokens": 1024,
+                },
             },
         )
+        print(f"[GEMINI] Status: {response.status_code}", flush=True)
+        if response.status_code != 200:
+            print(f"[GEMINI] Error body: {response.text[:500]}", flush=True)
         response.raise_for_status()
-        text = response.json()["message"]["content"]
-    return extract_json_array(text)
+        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    print(f"[GEMINI] Response: {text[:120]}...", flush=True)
+    result = extract_json_array(text)
+    cache.set(cache_key, result)
+    return result
 
 
 async def generate_butterfly_effect(headline):
@@ -148,7 +174,7 @@ async def generate_butterfly_effect(headline):
 
     try:
         preds = await asyncio.to_thread(
-            call_ollama, agent["system"], f"NEWS HEADLINE: {headline}"
+            call_gemini, agent["system"], f"NEWS HEADLINE: {headline}"
         )
         # Ensure we have exactly NUM_BRANCHES
         preds = preds[:NUM_BRANCHES]
@@ -181,6 +207,7 @@ async def generate_butterfly_effect(headline):
     yield {"event": "agent_done", "data": json.dumps({"agent_id": agent["id"]})}
 
     # --- Step 2: Each subsequent agent is called once per branch ---
+    # All 4 branch calls run in PARALLEL, then results are yielded sequentially
     for depth, agent in enumerate(AGENTS[1:], start=1):
         yield {
             "event": "agent_start",
@@ -193,49 +220,55 @@ async def generate_butterfly_effect(headline):
         }
         await asyncio.sleep(0.3)
 
-        for branch_idx in range(NUM_BRANCHES):
+        # Build contexts for all branches, then fire calls in parallel
+        async def call_branch(branch_idx, agent=agent):
             chain = branches[branch_idx]
             if not chain:
-                continue
-
-            # Build context showing only THIS branch's causal chain
+                return branch_idx, None, None
             context = f"NEWS HEADLINE: {headline}\n\n"
             context += "THE CAUSAL CHAIN SO FAR (each step caused the next):\n"
             for step_num, step in enumerate(chain, 1):
                 context += f"  Step {step_num} [{step['agent']}]: {step['prediction']}\n"
             context += "\nPredict the NEXT domino in this specific chain."
-
             try:
-                preds = await asyncio.to_thread(
-                    call_ollama, agent["system"], context
-                )
-                pred = preds[0]  # We only want 1 prediction per branch
-
-                branches[branch_idx].append({
-                    "agent": agent["name"],
-                    "agent_id": agent["id"],
-                    "prediction": pred["prediction"],
-                    "confidence": pred.get("confidence", "medium"),
-                })
-
-                yield {
-                    "event": "prediction",
-                    "data": json.dumps({
-                        "agent_id": agent["id"],
-                        "agent_name": agent["name"],
-                        "color": agent["color"],
-                        "icon": agent["icon"],
-                        "prediction": pred["prediction"],
-                        "timeframe": agent["timeframe_label"],
-                        "confidence": pred.get("confidence", "medium"),
-                        "branch": branch_idx,
-                        "depth": depth,
-                    }),
-                }
-                await asyncio.sleep(0.15)
-
+                preds = await asyncio.to_thread(call_gemini, agent["system"], context)
+                return branch_idx, preds[0], None
             except Exception as e:
-                yield {"event": "error", "data": json.dumps({"agent_id": agent["id"], "branch": branch_idx, "error": str(e)})}
+                return branch_idx, None, e
+
+        # Fire all branch calls in parallel
+        results = await asyncio.gather(*[call_branch(i) for i in range(NUM_BRANCHES)])
+
+        # Yield results sequentially to the UI
+        for branch_idx, pred, error in results:
+            if error is not None:
+                yield {"event": "error", "data": json.dumps({"agent_id": agent["id"], "branch": branch_idx, "error": str(error)})}
+                continue
+            if pred is None:
+                continue
+
+            branches[branch_idx].append({
+                "agent": agent["name"],
+                "agent_id": agent["id"],
+                "prediction": pred["prediction"],
+                "confidence": pred.get("confidence", "medium"),
+            })
+
+            yield {
+                "event": "prediction",
+                "data": json.dumps({
+                    "agent_id": agent["id"],
+                    "agent_name": agent["name"],
+                    "color": agent["color"],
+                    "icon": agent["icon"],
+                    "prediction": pred["prediction"],
+                    "timeframe": agent["timeframe_label"],
+                    "confidence": pred.get("confidence", "medium"),
+                    "branch": branch_idx,
+                    "depth": depth,
+                }),
+            }
+            await asyncio.sleep(0.15)
 
         yield {"event": "agent_done", "data": json.dumps({"agent_id": agent["id"]})}
 
