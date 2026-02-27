@@ -2,12 +2,14 @@ import json
 import os
 import re
 import httpx
+import diskcache
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
 app = FastAPI()
+cache = diskcache.Cache(".cache/gemini")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
@@ -106,7 +108,13 @@ def extract_json_array(text):
 
 
 def call_gemini(system_prompt, user_content):
-    """Make a single Gemini API call and return parsed predictions."""
+    """Make a single Gemini API call and return parsed predictions. Results are cached to disk."""
+    cache_key = f"{MODEL}:{system_prompt}:{user_content}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        print(f"\n[CACHE HIT] {user_content[:80]}...", flush=True)
+        return cached
+
     print(f"\n[GEMINI] Calling {MODEL}...", flush=True)
     print(f"[GEMINI] System: {system_prompt[:80]}...", flush=True)
     print(f"[GEMINI] User: {user_content[:80]}...", flush=True)
@@ -131,7 +139,9 @@ def call_gemini(system_prompt, user_content):
         response.raise_for_status()
         text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     print(f"[GEMINI] Response: {text[:120]}...", flush=True)
-    return extract_json_array(text)
+    result = extract_json_array(text)
+    cache.set(cache_key, result)
+    return result
 
 
 async def generate_butterfly_effect(headline):
