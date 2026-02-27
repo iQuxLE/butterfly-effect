@@ -1,89 +1,58 @@
 import json
 import os
 import re
+import subprocess
+import sys
 import httpx
 import diskcache
-import certifi
-from datetime import datetime, timezone
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
-from neo4j import GraphDatabase
 import asyncio
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
 
 app = FastAPI()
 cache = diskcache.Cache(".cache/gemini")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
-MODEL = "gemini-3-flash-preview"
+MODEL = "gemini-2.5-flash"
 
 if GEMINI_API_KEY:
     print(f"[STARTUP] GEMINI_API_KEY is set ({len(GEMINI_API_KEY)} chars)", flush=True)
 else:
     print("[STARTUP] WARNING: GEMINI_API_KEY is NOT set! API calls will fail.", flush=True)
 
-# --- Neo4j (Bolt driver) ---
-NEO4J_URI = "neo4j+s://cc16b147.databases.neo4j.io"
-NEO4J_USERNAME = "neo4j"
-NEO4J_PASSWORD = "Nk0yDtxAlIqC8SGdJX9tUCJ9aYSTfDDBFp90q7CtSDM"
-neo4j_driver = None
-
-if NEO4J_URI and NEO4J_PASSWORD:
-    try:
-        neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
-        neo4j_driver.verify_connectivity()
-        print(f"[STARTUP] Neo4j connected to {NEO4J_URI}", flush=True)
-    except Exception as e:
-        print(f"[STARTUP] WARNING: Neo4j connection failed: {e}", flush=True)
-        neo4j_driver = None
-else:
-    print("[STARTUP] Neo4j not configured (set NEO4J_URI and NEO4J_PASSWORD)", flush=True)
-
 
 def store_analysis(headline, branches):
-    """Store a completed analysis in Neo4j as a graph."""
-    if not neo4j_driver:
-        print("[NEO4J] Skipping store — not configured", flush=True)
-        return
+    """Store a completed analysis in Neo4j by calling upload_neo4j.py as a subprocess."""
+    # Convert branches to the format upload_neo4j.py expects
+    AGENT_KEYS = ["economist", "geopolitical", "social", "futurist"]
+    converted = []
+    for chain in branches:
+        branch_dict = {}
+        for i, step in enumerate(chain):
+            if i < len(AGENT_KEYS):
+                branch_dict[AGENT_KEYS[i]] = step["prediction"]
+        if len(branch_dict) == 4:
+            converted.append(branch_dict)
+    data = json.dumps({"headline": headline, "branches": converted})
+    print(f"[NEO4J] Spawning upload_neo4j.py for: {headline[:60]}...", flush=True)
     try:
-        now = datetime.now(timezone.utc).isoformat()
-        with neo4j_driver.session(database="neo4j") as session:
-            # Create headline node
-            session.run(
-                "CREATE (h:Headline {text: $text, created_at: $now})",
-                text=headline, now=now,
-            )
-
-            # Create each branch's causal chain
-            for branch_idx, chain in enumerate(branches):
-                if not chain:
-                    continue
-                session.run(
-                    """
-                    MATCH (h:Headline {text: $headline, created_at: $now})
-                    CREATE (e:Prediction {text: $p0, agent: $a0, agent_id: $aid0, confidence: $c0, timeframe: $tf0, branch: $branch, depth: 0, created_at: $now})
-                    CREATE (g:Prediction {text: $p1, agent: $a1, agent_id: $aid1, confidence: $c1, timeframe: $tf1, branch: $branch, depth: 1, created_at: $now})
-                    CREATE (s:Prediction {text: $p2, agent: $a2, agent_id: $aid2, confidence: $c2, timeframe: $tf2, branch: $branch, depth: 2, created_at: $now})
-                    CREATE (f:Prediction {text: $p3, agent: $a3, agent_id: $aid3, confidence: $c3, timeframe: $tf3, branch: $branch, depth: 3, created_at: $now})
-                    CREATE (h)-[:CAUSES]->(e)
-                    CREATE (e)-[:CAUSES]->(g)
-                    CREATE (g)-[:CAUSES]->(s)
-                    CREATE (s)-[:CAUSES]->(f)
-                    """,
-                    headline=headline, now=now, branch=branch_idx,
-                    p0=chain[0]["prediction"], a0=chain[0]["agent"], aid0=chain[0]["agent_id"], c0=chain[0]["confidence"], tf0=AGENTS[0]["timeframe_label"],
-                    p1=chain[1]["prediction"], a1=chain[1]["agent"], aid1=chain[1]["agent_id"], c1=chain[1]["confidence"], tf1=AGENTS[1]["timeframe_label"],
-                    p2=chain[2]["prediction"], a2=chain[2]["agent"], aid2=chain[2]["agent_id"], c2=chain[2]["confidence"], tf2=AGENTS[2]["timeframe_label"],
-                    p3=chain[3]["prediction"], a3=chain[3]["agent"], aid3=chain[3]["agent_id"], c3=chain[3]["confidence"], tf3=AGENTS[3]["timeframe_label"],
-                )
-                print(f"[NEO4J] Stored branch {branch_idx}", flush=True)
-
-        print(f"[NEO4J] Stored analysis for: {headline[:60]}...", flush=True)
+        result = subprocess.run(
+            [sys.executable, "upload_neo4j.py", data],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Print all output from the subprocess
+        for line in result.stdout.strip().splitlines():
+            print(f"  {line}", flush=True)
+        if result.returncode != 0:
+            print(f"[NEO4J] subprocess failed (exit {result.returncode})", flush=True)
+            for line in result.stderr.strip().splitlines():
+                print(f"  STDERR: {line}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[NEO4J] subprocess timed out after 30s", flush=True)
     except Exception as e:
-        print(f"[NEO4J] Error storing analysis: {e}", flush=True)
+        print(f"[NEO4J] Error spawning subprocess: {e}", flush=True)
 
 NUM_BRANCHES = 4
 
@@ -360,23 +329,3 @@ async def root():
 @app.get("/analyze")
 async def analyze(headline: str):
     return EventSourceResponse(generate_butterfly_effect(headline))
-
-
-@app.get("/history")
-async def history():
-    """Return all past analyses from Neo4j."""
-    if not neo4j_driver:
-        return JSONResponse({"error": "Neo4j not connected"}, status_code=503)
-    def _query():
-        with neo4j_driver.session(database="neo4j") as session:
-            result = session.run(
-                "MATCH (h:Headline)-[:CAUSES*]->(p:Prediction) "
-                "WITH h, p ORDER BY p.branch, p.depth "
-                "WITH h, collect({text: p.text, agent: p.agent, confidence: p.confidence, "
-                "branch: p.branch, depth: p.depth, timeframe: p.timeframe}) AS predictions "
-                "RETURN h.text AS headline, h.created_at AS created_at, predictions "
-                "ORDER BY h.created_at DESC"
-            )
-            return [dict(r) for r in result]
-    rows = await asyncio.to_thread(_query)
-    return JSONResponse(rows)

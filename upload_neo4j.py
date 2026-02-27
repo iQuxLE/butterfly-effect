@@ -4,6 +4,7 @@ Push butterfly-effect graph data to Neo4j Aura.
 Uses the Neo4j Bolt driver to push sample causal-chain graph data.
 """
 
+import json
 import os
 import sys
 
@@ -20,7 +21,7 @@ DATABASE = "neo4j"
 
 # Sample butterfly-effect graph data
 SAMPLE_DATA = {
-    "headline": "XYZ Court strikes down Trump tariffs",
+    "headline": "TESTER2 Court strikes down Trump tariffs",
     "branches": [
         {
             "economist": "US importers scramble to renegotiate contracts as tariff uncertainty lifts",
@@ -86,6 +87,11 @@ def upload_graph(driver):
 
 
 def main():
+    global SAMPLE_DATA
+    if len(sys.argv) > 1:
+        SAMPLE_DATA = json.loads(sys.argv[1])
+        print(f"[NEO4J] Received data: {SAMPLE_DATA['headline'][:60]}...", flush=True)
+
     print(f"Neo4j URI: {NEO4J_URI}")
 
     driver = GraphDatabase.driver(NEO4J_URI, auth=(USERNAME, PASSWORD))
