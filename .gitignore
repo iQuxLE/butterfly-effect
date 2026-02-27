@@ -1,1 +1,5 @@
 .firecrawl/
+venv/
+.cache/
+Neo4j-*.txt
+__pycache__/
