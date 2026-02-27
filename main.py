@@ -1,10 +1,12 @@
 import json
 import os
 import re
+import base64
 import httpx
 import diskcache
+from datetime import datetime, timezone
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
@@ -19,6 +21,100 @@ if GEMINI_API_KEY:
     print(f"[STARTUP] GEMINI_API_KEY is set ({len(GEMINI_API_KEY)} chars)", flush=True)
 else:
     print("[STARTUP] WARNING: GEMINI_API_KEY is NOT set! API calls will fail.", flush=True)
+
+# --- Neo4j (Query API v2) ---
+NEO4J_HOST = os.environ.get("NEO4J_HOST", "")  # e.g. cc16b147.databases.neo4j.io
+NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_URL = f"https://{NEO4J_HOST}/db/neo4j/query/v2" if NEO4J_HOST else ""
+neo4j_auth = ""
+
+if NEO4J_HOST and NEO4J_PASSWORD:
+    neo4j_auth = base64.b64encode(f"{NEO4J_USERNAME}:{NEO4J_PASSWORD}".encode()).decode()
+    print(f"[STARTUP] Neo4j configured: {NEO4J_HOST}", flush=True)
+    # Test connectivity
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            resp = c.post(
+                NEO4J_URL,
+                headers={
+                    "Authorization": f"Basic {neo4j_auth}",
+                    "Content-Type": "application/json",
+                },
+                json={"statement": "RETURN 1 AS ok"},
+            )
+            print(f"[STARTUP] Neo4j connectivity test: {resp.status_code}", flush=True)
+            if resp.status_code != 202:
+                print(f"[STARTUP] Neo4j error: {resp.text[:300]}", flush=True)
+    except Exception as e:
+        print(f"[STARTUP] Neo4j connectivity test failed: {e}", flush=True)
+else:
+    print("[STARTUP] Neo4j not configured (set NEO4J_HOST and NEO4J_PASSWORD)", flush=True)
+
+
+def neo4j_query(statement, parameters=None):
+    """Execute a Cypher statement via the Neo4j Query API v2. Returns the response JSON."""
+    if not neo4j_auth:
+        return None
+    body = {"statement": statement}
+    if parameters:
+        body["parameters"] = parameters
+    with httpx.Client(timeout=30.0) as c:
+        resp = c.post(
+            NEO4J_URL,
+            headers={
+                "Authorization": f"Basic {neo4j_auth}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        print(f"[NEO4J] Query status: {resp.status_code}", flush=True)
+        if resp.status_code != 202:
+            print(f"[NEO4J] Error: {resp.text[:500]}", flush=True)
+            return {"error": resp.text}
+        return resp.json()
+
+
+def store_analysis(headline, branches):
+    """Store a completed analysis in Neo4j as a graph via Query API v2."""
+    if not neo4j_auth:
+        print("[NEO4J] Skipping store — not configured", flush=True)
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Build a single Cypher statement that creates the entire graph
+        cypher = "CREATE (h:Headline {text: $headline, created_at: $now}) "
+        params = {"headline": headline, "now": now}
+
+        for branch_idx, chain in enumerate(branches):
+            for depth, step in enumerate(chain):
+                node_var = f"p{branch_idx}_{depth}"
+                parent_var = f"p{branch_idx}_{depth - 1}" if depth > 0 else "h"
+                cypher += (
+                    f"CREATE ({node_var}:Prediction {{"
+                    f"text: ${node_var}_text, agent: ${node_var}_agent, "
+                    f"agent_id: ${node_var}_aid, confidence: ${node_var}_conf, "
+                    f"branch: {branch_idx}, depth: {depth}, "
+                    f"timeframe: ${node_var}_tf, created_at: $now}}) "
+                    f"CREATE ({parent_var})-[:CAUSED]->({node_var}) "
+                )
+                params[f"{node_var}_text"] = step["prediction"]
+                params[f"{node_var}_agent"] = step["agent"]
+                params[f"{node_var}_aid"] = step["agent_id"]
+                params[f"{node_var}_conf"] = step["confidence"]
+                params[f"{node_var}_tf"] = AGENTS[depth]["timeframe_label"]
+
+        cypher += "RETURN h.text AS headline"
+
+        result = neo4j_query(cypher, params)
+
+        if result and not result.get("error"):
+            print(f"[NEO4J] Stored analysis for: {headline[:60]}...", flush=True)
+        else:
+            print(f"[NEO4J] Failed to store analysis", flush=True)
+    except Exception as e:
+        print(f"[NEO4J] Error storing analysis: {e}", flush=True)
 
 NUM_BRANCHES = 4
 
@@ -107,7 +203,7 @@ def extract_json_array(text):
     raise ValueError(f"No JSON array found in: {text[:200]}")
 
 
-def call_gemini(system_prompt, user_content):
+def call_gemini(system_prompt, user_content, max_retries=5, timeout=10.0):
     """Make a single Gemini API call and return parsed predictions. Results are cached to disk."""
     cache_key = f"{MODEL}:{system_prompt}:{user_content}"
     cached = cache.get(cache_key)
@@ -115,33 +211,40 @@ def call_gemini(system_prompt, user_content):
         print(f"\n[CACHE HIT] {user_content[:80]}...", flush=True)
         return cached
 
-    print(f"\n[GEMINI] Calling {MODEL}...", flush=True)
-    print(f"[GEMINI] System: {system_prompt[:80]}...", flush=True)
-    print(f"[GEMINI] User: {user_content[:80]}...", flush=True)
     if not GEMINI_API_KEY:
         print("[GEMINI] ERROR: GEMINI_API_KEY is not set!", flush=True)
         raise ValueError("GEMINI_API_KEY environment variable is not set")
-    with httpx.Client(timeout=120.0) as http_client:
-        response = http_client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json={
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-                "generationConfig": {
-                    "temperature": 0.8,
-                    "maxOutputTokens": 1024,
-                },
-            },
-        )
-        print(f"[GEMINI] Status: {response.status_code}", flush=True)
-        if response.status_code != 200:
-            print(f"[GEMINI] Error body: {response.text[:500]}", flush=True)
-        response.raise_for_status()
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    print(f"[GEMINI] Response: {text[:120]}...", flush=True)
-    result = extract_json_array(text)
-    cache.set(cache_key, result)
-    return result
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"\n[GEMINI] Attempt {attempt}/{max_retries} — {MODEL}...", flush=True)
+            print(f"[GEMINI] User: {user_content[:80]}...", flush=True)
+            with httpx.Client(timeout=timeout) as http_client:
+                response = http_client.post(
+                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                    json={
+                        "systemInstruction": {"parts": [{"text": system_prompt}]},
+                        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+                        "generationConfig": {
+                            "temperature": 0.8,
+                            "maxOutputTokens": 1024,
+                        },
+                    },
+                )
+                print(f"[GEMINI] Status: {response.status_code}", flush=True)
+                if response.status_code != 200:
+                    print(f"[GEMINI] Error body: {response.text[:500]}", flush=True)
+                response.raise_for_status()
+                text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            print(f"[GEMINI] Response: {text[:120]}...", flush=True)
+            result = extract_json_array(text)
+            cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            print(f"[GEMINI] Attempt {attempt} failed: {e}", flush=True)
+            if attempt == max_retries:
+                print(f"[GEMINI] FAILED after {max_retries} attempts: {user_content[:80]}...", flush=True)
+                raise
 
 
 async def generate_butterfly_effect(headline):
@@ -273,6 +376,10 @@ async def generate_butterfly_effect(headline):
         yield {"event": "agent_done", "data": json.dumps({"agent_id": agent["id"]})}
 
     total = sum(len(b) for b in branches)
+
+    # Store the full analysis in Neo4j
+    await asyncio.to_thread(store_analysis, headline, branches)
+
     yield {"event": "complete", "data": json.dumps({"total_predictions": total})}
 
 
@@ -284,3 +391,27 @@ async def root():
 @app.get("/analyze")
 async def analyze(headline: str):
     return EventSourceResponse(generate_butterfly_effect(headline))
+
+
+@app.get("/history")
+async def history():
+    """Return all past analyses from Neo4j."""
+    if not neo4j_auth:
+        return JSONResponse({"error": "Neo4j not connected"}, status_code=503)
+    result = await asyncio.to_thread(
+        neo4j_query,
+        "MATCH (h:Headline)-[:CAUSED*]->(p:Prediction) "
+        "WITH h, p ORDER BY p.branch, p.depth "
+        "WITH h, collect({text: p.text, agent: p.agent, confidence: p.confidence, "
+        "branch: p.branch, depth: p.depth, timeframe: p.timeframe}) AS predictions "
+        "RETURN h.text AS headline, h.created_at AS created_at, predictions "
+        "ORDER BY h.created_at DESC",
+    )
+    if not result or result.get("error"):
+        return JSONResponse({"error": "Query failed"}, status_code=500)
+    fields = result["data"]["fields"]
+    analyses = [
+        dict(zip(fields, row))
+        for row in result["data"]["values"]
+    ]
+    return JSONResponse(analyses)

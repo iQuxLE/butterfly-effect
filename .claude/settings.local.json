@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(lsof:*)"
+      "Bash(lsof:*)",
+      "WebSearch",
+      "WebFetch(domain:neo4j.com)",
+      "Bash(source:*)",
+      "Bash(pip3 list:*)",
+      "Bash(python3:*)"
     ]
   }
 }
