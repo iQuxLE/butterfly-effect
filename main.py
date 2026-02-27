@@ -26,9 +26,9 @@ else:
     print("[STARTUP] WARNING: GEMINI_API_KEY is NOT set! API calls will fail.", flush=True)
 
 # --- Neo4j (Bolt driver) ---
-NEO4J_URI = os.environ.get("NEO4J_URI", "")  # e.g. neo4j+s://cc16b147.databases.neo4j.io
-NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_URI = "neo4j+s://cc16b147.databases.neo4j.io"
+NEO4J_USERNAME = "neo4j"
+NEO4J_PASSWORD = "Nk0yDtxAlIqC8SGdJX9tUCJ9aYSTfDDBFp90q7CtSDM"
 neo4j_driver = None
 
 if NEO4J_URI and NEO4J_PASSWORD:
