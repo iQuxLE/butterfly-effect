@@ -242,9 +242,63 @@
   }
 
   .overlay.visible { opacity: 1; pointer-events: all; }
+
+  /* News Sidebar */
+  .news-toggle {
+    position: fixed; top: 1rem; left: 1rem; z-index: 100;
+    padding: 0.5rem 1rem; font-size: 0.85rem; font-family: 'Inter', sans-serif; font-weight: 500;
+    background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.3);
+    border-radius: 20px; color: #60a5fa; cursor: pointer; transition: all 0.2s;
+  }
+  .news-toggle:hover { background: rgba(96, 165, 250, 0.25); }
+  .news-toggle .badge {
+    display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 6px;
+    font-size: 0.7rem; font-weight: 700; text-align: center;
+    background: #60a5fa; color: #0a0a0f; border-radius: 10px;
+  }
+
+  .news-sidebar {
+    position: fixed; top: 0; left: 0; width: 300px; height: 100vh;
+    background: rgba(15, 15, 25, 0.98); border-right: 1px solid rgba(255,255,255,0.08);
+    backdrop-filter: blur(20px); z-index: 200; overflow-y: auto;
+    transform: translateX(-100%); transition: transform 0.3s ease; padding: 1.5rem;
+  }
+  .news-sidebar.open { transform: translateX(0); }
+
+  .news-sidebar h3 {
+    font-size: 1rem; font-weight: 600; color: #fff; margin-bottom: 1rem;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .news-sidebar .close-sidebar {
+    background: none; border: none; color: #666; font-size: 1.4rem;
+    cursor: pointer; padding: 0 4px; transition: color 0.2s;
+  }
+  .news-sidebar .close-sidebar:hover { color: #fff; }
+
+  .news-item {
+    padding: 0.8rem; margin-bottom: 0.5rem; border-radius: 8px; cursor: pointer;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    transition: all 0.2s;
+  }
+  .news-item:hover { background: rgba(255,255,255,0.07); border-color: rgba(96, 165, 250, 0.3); }
+  .news-item .news-headline { font-size: 0.85rem; font-weight: 600; color: #e0e0e0; margin-bottom: 0.3rem; }
+  .news-item .news-summary { font-size: 0.75rem; color: #888; line-height: 1.4; }
+  .news-item .news-source { font-size: 0.65rem; color: #555; margin-top: 0.3rem; }
+
+  .news-empty { text-align: center; color: #555; font-size: 0.85rem; padding: 2rem 0; }
+  .news-loading { color: #60a5fa; }
 </style>
 </head>
 <body>
+
+<button class="news-toggle" id="news-toggle" onclick="toggleSidebar()">News Feed <span class="badge" id="news-badge">0</span></button>
+
+<div class="news-sidebar" id="news-sidebar">
+  <h3>Live News Feed <button class="close-sidebar" onclick="toggleSidebar()">&times;</button></h3>
+  <div id="news-list">
+    <div class="news-empty news-loading">Fetching latest news...</div>
+  </div>
+</div>
 
 <div class="container">
   <div class="header">
@@ -637,6 +691,84 @@ async function analyze() {
     document.getElementById('loading-text').classList.remove('visible');
   });
 }
+
+// --- News Feed ---
+let sidebarOpen = false;
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  document.getElementById('news-sidebar').classList.toggle('open', sidebarOpen);
+}
+
+function useHeadline(text) {
+  document.getElementById('headline-input').value = text;
+  sidebarOpen = false;
+  document.getElementById('news-sidebar').classList.remove('open');
+}
+
+function renderNewsItems(items) {
+  const list = document.getElementById('news-list');
+  const badge = document.getElementById('news-badge');
+  let html = '';
+  let count = 0;
+  for (const item of items) {
+    if (item.headline) {
+      count++;
+      const escaped = (item.headline || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+      html += `
+        <div class="news-item" onclick="useHeadline('${escaped}')">
+          <div class="news-headline">${item.headline}</div>
+          <div class="news-summary">${item.summary || ''}</div>
+          <div class="news-source">${item.source || ''}</div>
+        </div>
+      `;
+    }
+  }
+  if (html) {
+    list.innerHTML = html;
+    badge.textContent = count;
+  }
+}
+
+async function loadNewsFeed() {
+  const list = document.getElementById('news-list');
+
+  // 1) Fetch from Google (cached or first-time Gemini call)
+  try {
+    const resp = await fetch('/news');
+    const data = await resp.json();
+    console.log('[news] google:', data.source, data.headlines?.length || 0, 'items');
+    if (data.headlines && data.headlines.length > 0) {
+      renderNewsItems(data.headlines);
+    } else {
+      list.innerHTML = '<div class="news-empty">No headlines available.</div>';
+    }
+  } catch (e) {
+    console.error('[news] google error:', e);
+    list.innerHTML = '<div class="news-empty">Failed to load news.</div>';
+  }
+
+  // 2) Try Yutori in background (20s timeout), update if it returns
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const resp = await fetch('/news/refresh', { signal: controller.signal });
+    clearTimeout(timeout);
+    const data = await resp.json();
+    console.log('[news] yutori:', data.source, data.headlines?.length || 0, 'items');
+    if (data.headlines && data.headlines.length > 0) {
+      renderNewsItems(data.headlines);
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      console.log('[news] yutori timed out (20s), using google results');
+    } else {
+      console.error('[news] yutori error:', e);
+    }
+  }
+}
+
+loadNewsFeed();
 
 document.getElementById('headline-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') analyze();

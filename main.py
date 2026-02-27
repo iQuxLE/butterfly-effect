@@ -6,7 +6,7 @@ import sys
 import httpx
 import diskcache
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
@@ -55,6 +55,9 @@ def store_analysis(headline, branches):
         print(f"[NEO4J] Error spawning subprocess: {e}", flush=True)
 
 NUM_BRANCHES = 4
+
+YUTORI_API_KEY = os.environ.get("YUTORI_API_KEY", "")
+YUTORI_BASE_URL = "https://api.yutori.com/v1"
 
 # Each agent handles a specific time horizon and perspective.
 # The Economist creates the initial branches (NUM_BRANCHES predictions).
@@ -329,3 +332,98 @@ async def root():
 @app.get("/analyze")
 async def analyze(headline: str):
     return EventSourceResponse(generate_butterfly_effect(headline))
+
+
+def fetch_news_from_gemini():
+    """Fetch news headlines from Gemini with a higher token limit than call_gemini."""
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not set")
+
+    with httpx.Client(timeout=120.0) as client:
+        response = client.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json={
+                "systemInstruction": {"parts": [{"text":
+                    "You are a news aggregator. Return ONLY a JSON array, no other text."
+                }]},
+                "contents": [{"role": "user", "parts": [{"text":
+                    "Top 5 breaking news headlines today. Politics, economics, tech, geopolitics. "
+                    'Return ONLY: [{"headline":"...","summary":"1 short sentence","source":"source"}]'
+                }]}],
+                "generationConfig": {"temperature": 0.8, "maxOutputTokens": 4096},
+            },
+        )
+        response.raise_for_status()
+        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    return extract_json_array(text)
+
+
+@app.get("/news")
+async def get_news():
+    """Get news feed. Returns cached headlines or fetches from Gemini on first call."""
+    cached = cache.get("news_feed")
+    if cached is not None:
+        return JSONResponse({"headlines": cached, "source": "cache"})
+
+    try:
+        result = await asyncio.to_thread(fetch_news_from_gemini)
+        cache.set("news_feed", result)
+        return JSONResponse({"headlines": result, "source": "google"})
+    except Exception as e:
+        return JSONResponse({"headlines": [], "source": "error", "error": str(e)})
+
+
+@app.get("/news/refresh")
+async def refresh_news_yutori():
+    """Try to get fresh news from Yutori Browsing API. Client should use a 20s timeout."""
+    if not YUTORI_API_KEY:
+        return JSONResponse({"headlines": [], "source": "no_key"})
+
+    headers = {"X-API-Key": YUTORI_API_KEY, "Content-Type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                f"{YUTORI_BASE_URL}/browsing/tasks",
+                headers=headers,
+                json={
+                    "task": "Extract the top 8 current breaking news headlines with a 1-sentence summary for each. Focus on politics, economics, technology, and world events.",
+                    "start_url": "https://apnews.com",
+                    "max_steps": 15,
+                    "output_schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "headline": {"type": "string", "description": "Short news headline"},
+                                "summary": {"type": "string", "description": "1-sentence summary"},
+                                "source": {"type": "string", "description": "News source name"},
+                            },
+                        },
+                    },
+                },
+            )
+            resp.raise_for_status()
+            task_id = resp.json()["task_id"]
+
+            for _ in range(6):
+                await asyncio.sleep(3)
+                status_resp = await client.get(
+                    f"{YUTORI_BASE_URL}/browsing/tasks/{task_id}",
+                    headers={"X-API-Key": YUTORI_API_KEY},
+                )
+                status_resp.raise_for_status()
+                data = status_resp.json()
+
+                if data["status"] == "succeeded":
+                    headlines = data.get("structured_result") or []
+                    if headlines:
+                        cache.set("news_feed", headlines)
+                    return JSONResponse({"headlines": headlines, "source": "yutori"})
+                elif data["status"] == "failed":
+                    return JSONResponse({"headlines": [], "source": "yutori_failed"})
+
+    except Exception as e:
+        return JSONResponse({"headlines": [], "source": "yutori_error", "error": str(e)})
+
+    return JSONResponse({"headlines": [], "source": "yutori_timeout"})
