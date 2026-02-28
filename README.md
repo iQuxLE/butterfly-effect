@@ -1,4 +1,4 @@
-# CLAUDE.md — Butterfly Effect Machine
+#  Butterfly Effect Machine
 
 ## Origin Story
 
